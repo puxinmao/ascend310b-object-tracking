@@ -1,0 +1,31 @@
+# 大文件（CANN安装包、PDF文档）- 这些是材料，不纳入版本控制
+*.run
+*.pdf
+1.txt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+
+# 系统
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# STM32编译产物
+*/STM32*/build/
+*/STM32*/Debug/
+*/STM32*/Release/
+*.o
+*.elf
+*.hex
+*.bin
