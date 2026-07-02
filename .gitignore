@@ -1,0 +1,14 @@
+# STM32生成的库文件（可重新生成）
+stm32control/Drivers/
+stm32control/.settings/
+stm32control/cmake/
+stm32control/build/
+
+# Python缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 系统文件
+.DS_Store
+Thumbs.db
