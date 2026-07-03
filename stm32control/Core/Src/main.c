@@ -34,8 +34,16 @@
 /* 舵机 PWM 参数 */
 #define SERVO_PULSE_MIN    500    /* 0°   → 0.5ms */
 #define SERVO_PULSE_MAX    2500   /* 180° → 2.5ms */
-#define SWEEP_STEP_MS      10     /* 每步延时 (ms) */
-#define STEP_DELAY_MS      20     /* 舵机每度步进延时 (ms) — 越大越慢 */
+#define STEP_DELAY_MS      50     /* 主循环周期 (ms) */
+#define SERVO_RANGE_MIN    30     /* 舵机最小角度 */
+#define SERVO_RANGE_MAX    150    /* 舵机最大角度 */
+
+#define SPEED_MAX          4      /* 最大速度（度/步） */
+
+/* 防抖参数 */
+#define FILTER_ALPHA       25     /* 输入滤波系数 0~100 (越大响应越快) */
+#define DEAD_ZONE_PAN      5      /* 水平死区（度） */
+#define DEAD_ZONE_TILT     7      /* 俯仰死区 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -49,8 +57,14 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-volatile uint8_t rx_byte = 0x5A;  /* 最新收到的串口位置数据 (volatile: 中断修改) */
-uint8_t current_angle = 90;       /* 当前舵机角度 */
+volatile uint8_t rx_bytes[2] = {0x5A, 0x5A}; /* [0]=水平, [1]=俯仰 */
+volatile uint8_t rx_byte   = 0;              /* 中断接收临时缓冲 */
+volatile uint8_t rx_toggle = 0;              /* 0=收水平, 1=收俯仰 */
+volatile uint8_t rx_count  = 0;              /* 收到字节计数器（用于调试） */
+uint8_t  pan_angle  = 90;        /* 当前水平舵机角度 */
+uint16_t pan_filter_x10  = 900;  /* 水平滤波目标×10 */
+uint8_t  tilt_angle = 90;        /* 当前俯仰舵机角度 */
+uint16_t tilt_filter_x10 = 900;  /* 俯仰滤波目标×10 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -59,22 +73,33 @@ static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
 /* USER CODE BEGIN PFP */
-static void Servo_SetAngle(int angle);
+static void Servo_SetPan(int angle);
+static void Servo_SetTilt(int angle);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
 
 /**
- * @brief  设置舵机角度
- * @param  angle  目标角度 0~180
+ * @brief  设置水平舵机角度 (TIM2_CH1)
  */
-static void Servo_SetAngle(int angle)
+static void Servo_SetPan(int angle)
 {
     if (angle < 0)   angle = 0;
     if (angle > 180) angle = 180;
     uint32_t pulse = SERVO_PULSE_MIN + (uint32_t)((float)angle / 180.0f * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
     __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, pulse);
+}
+
+/**
+ * @brief  设置俯仰舵机角度 (TIM2_CH2)
+ */
+static void Servo_SetTilt(int angle)
+{
+    if (angle < 0)   angle = 0;
+    if (angle > 180) angle = 180;
+    uint32_t pulse = SERVO_PULSE_MIN + (uint32_t)((float)angle / 180.0f * (SERVO_PULSE_MAX - SERVO_PULSE_MIN));
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_2, pulse);
 }
 
 /* USER CODE END 0 */
@@ -110,9 +135,11 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
+  /* 立即启动串口中断接收 */
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
   /* USER CODE BEGIN 2 */
-  /* LED 闪烁 3 次 — 指示芯片已启动 */
-  for (int i = 0; i < 3; i++) {
+  /* LED 闪烁 2 次 — 指示芯片已启动 */
+  for (int i = 0; i < 2; i++) {
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET); /* 亮 */
     HAL_Delay(200);
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);   /* 灭 */
@@ -120,30 +147,47 @@ int main(void)
   }
 
   HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_1);
-  Servo_SetAngle(90);
-  HAL_Delay(500);
+  HAL_TIM_PWM_Start(&htim2, TIM_CHANNEL_2);
 
-  /* 启动串口中断接收 — 每次收到 1 字节 */
-  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+  /* ── 舵机上电自检（逐个测，避开极端位置防供电不足）── */
+  Servo_SetTilt(90);
+  Servo_SetPan(30);  HAL_Delay(500);
+  Servo_SetPan(150); HAL_Delay(500);
+  Servo_SetPan(90);  HAL_Delay(500);
   /* USER CODE END 2 */
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-    /* LED 慢闪 — 运行指示 */
-    HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_13);
+    /* LED: 收到数据就常亮 */
+    if (rx_count > 0) {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+    } else {
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+    }
 
-    /* 将串口位置数据(0x00~0xB4)反向映射到舵机角度(0~180) */
-    /* 人在左边(0x00~0x59) → 舵机向右转；人在右边(0x5B~0xB4) → 舵机向左转 */
-    uint8_t target_angle = (uint8_t)(180 - ((uint32_t)rx_byte * 180 / 0xB4));
+    /* ═══ 水平：滤波 + 死区 + 加减速 ═══ */
+    uint8_t raw_pan = (uint8_t)(180 - ((uint32_t)rx_bytes[0] * 180 / 0xB4));
+    raw_pan = SERVO_RANGE_MIN + (uint8_t)((uint32_t)raw_pan * (SERVO_RANGE_MAX - SERVO_RANGE_MIN) / 180);
+    pan_filter_x10 = (uint16_t)(((uint32_t)raw_pan * FILTER_ALPHA * 10
+                     + pan_filter_x10 * (100 - FILTER_ALPHA)) / 100);
+    int diff_pan = (int)(pan_filter_x10 / 10) - (int)pan_angle;
+    if      (diff_pan >  DEAD_ZONE_PAN) pan_angle += 2;
+    else if (diff_pan < -DEAD_ZONE_PAN) pan_angle -= 2;
+    Servo_SetPan(pan_angle);
 
-    /* 逐步逼近目标角度(平滑运动) */
-    if (current_angle < target_angle) current_angle++;
-    else if (current_angle > target_angle) current_angle--;
+    /* ═══ 俯仰：滤波 + 死区(6°) + 1°/步 ═══ */
+    uint8_t raw_tilt = (uint8_t)((uint32_t)rx_bytes[1] * 180 / 0xB4);
+    raw_tilt = SERVO_RANGE_MIN + (uint8_t)((uint32_t)raw_tilt * (SERVO_RANGE_MAX - SERVO_RANGE_MIN) / 180);
+    tilt_filter_x10 = (uint16_t)(((uint32_t)raw_tilt * FILTER_ALPHA * 10
+                      + tilt_filter_x10 * (100 - FILTER_ALPHA)) / 100);
+    int diff_tilt = (int)(tilt_filter_x10 / 10) - (int)tilt_angle;
+    if      (diff_tilt >  DEAD_ZONE_TILT) tilt_angle += 2;
+    else if (diff_tilt < -DEAD_ZONE_TILT) tilt_angle -= 2;
+    Servo_SetTilt(tilt_angle);
 
-    Servo_SetAngle(current_angle);
-    HAL_Delay(STEP_DELAY_MS);
+    HAL_Delay(50);
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -232,6 +276,10 @@ static void MX_TIM2_Init(void)
   {
     Error_Handler();
   }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK)
+  {
+    Error_Handler();
+  }
   /* USER CODE BEGIN TIM2_Init 2 */
 
   /* USER CODE END TIM2_Init 2 */
@@ -286,9 +334,9 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
-  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   /* PC13 板载 LED — 芯片运行指示灯 */
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   GPIO_InitStruct.Pin = GPIO_PIN_13;
@@ -304,12 +352,20 @@ static void MX_GPIO_Init(void)
 
 /**
  * @brief  UART 接收完成回调
- *         收到一个字节后，重新启动中断接收下一个字节
+ *         每收到 1 字节，交替存入 rx_bytes[0]（水平）和 rx_bytes[1]（俯仰）
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
+        if (rx_toggle == 0) {
+            rx_bytes[0] = rx_byte;  /* 第 1 字节 → 水平 */
+            rx_toggle = 1;
+        } else {
+            rx_bytes[1] = rx_byte;  /* 第 2 字节 → 俯仰 */
+            rx_toggle = 0;
+        }
+        rx_count++;
         HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
     }
 }

@@ -97,7 +97,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track-center-distance-threshold", type=float, default=1.8, help="Maximum normalized center distance used for fallback association.")
     parser.add_argument("--track-size-smoothing", type=float, default=0.8, help="Track box size smoothing factor in [0, 1). Higher means more stable but less responsive.")
     parser.add_argument("--track-score-smoothing", type=float, default=0.7, help="Track score smoothing factor in [0, 1). Higher means less score flicker.")
-    parser.add_argument("--track-classes", default="", help="Comma-separated class names or ids to track, for example 'person,bus' or '1,6'.")
+    parser.add_argument("--track-classes", default="person", help="Comma-separated class names or ids to track, for example 'person,bus' or '1,6'.")
     parser.add_argument("--serial-port", default="/dev/ttyUSB0", help="Serial port for servo control. Set to empty to disable.")
     return parser.parse_args()
 
@@ -141,12 +141,30 @@ def print_tracking_startup(
     print("Press 'q' to quit.")
 
 
-def _select_primary_target(tracks, frame_center_x, frame_center_y):
-    """从所有活跃轨迹中选离画面中心最近的目标，返回其水平中心 x。"""
+def _select_or_follow_target(tracks, frame_center_x, frame_center_y, locked_id):
+    """
+    锁定跟随策略：
+    1. locked_id 还在 tracks 中 → 继续用它（不切换）
+    2. locked_id 已消失 → 释放锁
+    3. 无锁 → 选离画面中心最近的人并锁定
+    返回 (target_cx, target_cy, new_locked_id)
+    """
     if not tracks:
-        return None
+        return None, None, None
+
+    # 有锁：看锁定目标还在不在
+    if locked_id is not None:
+        for track in tracks:
+            if track.track_id == locked_id:
+                cx = (track.bbox[0] + track.bbox[2]) * 0.5
+                cy = (track.bbox[1] + track.bbox[3]) * 0.5
+                return cx, cy, locked_id  # 还在，继续跟
+
+    # 无锁 或 锁定目标已消失 → 选离中心最近的目标并锁定
     min_dist = float("inf")
     best_cx = None
+    best_cy = None
+    best_id = None
     for track in tracks:
         cx = (track.bbox[0] + track.bbox[2]) * 0.5
         cy = (track.bbox[1] + track.bbox[3]) * 0.5
@@ -154,7 +172,9 @@ def _select_primary_target(tracks, frame_center_x, frame_center_y):
         if dist < min_dist:
             min_dist = dist
             best_cx = cx
-    return best_cx
+            best_cy = cy
+            best_id = track.track_id
+    return best_cx, best_cy, best_id
 
 
 def render_tracking_frame(
@@ -170,6 +190,7 @@ def render_tracking_frame(
     frame_count: int,
     capture_context,
     serial_ctrl: Optional[SerialController] = None,
+    target_lock: Optional[list] = None,
 ):
     detections, profile_ms = backend.infer_with_profile(
         frame,
@@ -188,13 +209,19 @@ def render_tracking_frame(
     draw_ms = (time.perf_counter() - draw_start) * 1000.0
     timing_totals["draw"] += draw_ms
 
-    # 串口舵机控制：选主目标 → 算角度 → 发送
-    if serial_ctrl is not None and tracks:
+    # 串口舵机控制：锁定跟随 → 算角度 → 发送
+    if serial_ctrl is not None:
         frame_h, frame_w = frame.shape[:2]
-        target_cx = _select_primary_target(tracks, frame_w * 0.5, frame_h * 0.5)
-        if target_cx is not None:
-            angle = int(target_cx / frame_w * 180)
-            serial_ctrl.send_angle(angle)
+        locked_id = target_lock[0] if target_lock else None
+        target_cx, target_cy, new_locked_id = _select_or_follow_target(
+            tracks, frame_w * 0.5, frame_h * 0.5, locked_id
+        )
+        if target_lock is not None:
+            target_lock[0] = new_locked_id
+        if target_cx is not None and target_cy is not None and new_locked_id is not None:
+            h_angle = int(target_cx / frame_w * 180)
+            v_angle = int(target_cy / frame_h * 180)
+            serial_ctrl.send_angles(h_angle, v_angle)
 
     return annotated, fps
 
@@ -221,6 +248,7 @@ def main() -> int:
     timing_totals = create_timing_totals()
     pending_frame = capture_context.first_frame
     pending_read_ms = capture_context.first_read_ms
+    target_lock = [None]  # 跨帧锁定状态：当前跟随的目标 ID
 
     try:
         print_tracking_startup(args, labels, allowed_track_class_ids, model_path, backend, capture_context)
@@ -245,6 +273,7 @@ def main() -> int:
                 frame_count,
                 capture_context,
                 serial_ctrl=serial_ctrl,
+                target_lock=target_lock,
             )
 
             if args.save:

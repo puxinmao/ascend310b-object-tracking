@@ -3,7 +3,7 @@
 
 用法:
     controller = SerialController()
-    controller.send_angle(90)    # 发送 90°
+    controller.send_angles(90, 90)  # 发送水平90°, 俯仰90°
     controller.close()
 
 如果串口设备不存在或打开失败，会打印警告并进入无操作模式（不中断跟踪）。
@@ -38,22 +38,24 @@ class SerialController:
             print(f"[SerialController] 警告: 无法打开串口 {port}: {exc}")
             print("[SerialController] 舵机控制已禁用，跟踪功能正常运行。")
 
-    def send_angle(self, angle: int) -> None:
+    def send_angles(self, h_angle: int, v_angle: int) -> None:
         """
-        发送舵机角度 (0~180)。
+        发送水平和俯仰角度 (各 0~180)。
 
-        只发送单字节，丢帧不影响（下一帧会补发）。
+        发送 2 字节：[水平, 俯仰]，丢帧不影响（下一帧会补发）。
         角度会自动钳位到 0~180 范围。
 
         Args:
-            angle: 目标角度 0~180
+            h_angle: 水平角度 0~180（左→右）
+            v_angle: 俯仰角度 0~180（上→下）
         """
         if not self._enabled or self.ser is None:
             return
 
-        angle = max(0, min(180, int(angle)))
+        h_angle = max(0, min(180, int(h_angle)))
+        v_angle = max(0, min(180, int(v_angle)))
         try:
-            self.ser.write(bytes([angle]))
+            self.ser.write(bytes([h_angle, v_angle]))
         except Exception as exc:
             print(f"[SerialController] 发送失败: {exc}")
 
