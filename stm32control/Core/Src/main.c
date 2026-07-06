@@ -35,15 +35,16 @@
 #define SERVO_PULSE_MIN    500    /* 0°   → 0.5ms */
 #define SERVO_PULSE_MAX    2500   /* 180° → 2.5ms */
 #define STEP_DELAY_MS      50     /* 主循环周期 (ms) */
-#define SERVO_RANGE_MIN    30     /* 舵机最小角度 */
-#define SERVO_RANGE_MAX    150    /* 舵机最大角度 */
+#define SERVO_RANGE_MIN    0      /* 舵机最小角度（扩展至 0°，原 30°） */
+#define SERVO_RANGE_MAX    180    /* 舵机最大角度（扩展至 180°，原 150°） */
 
-#define SPEED_MAX          4      /* 最大速度（度/步） */
+#define SPEED_MAX          6      /* 最大速度（度/步），实际使用 STEP_DEGREE */
 
 /* 防抖参数 */
-#define FILTER_ALPHA       25     /* 输入滤波系数 0~100 (越大响应越快) */
-#define DEAD_ZONE_PAN      5      /* 水平死区（度） */
-#define DEAD_ZONE_TILT     7      /* 俯仰死区 */
+#define FILTER_ALPHA       35     /* 输入滤波系数 0~100 (越大响应越快，Python已平滑故提高) */
+#define DEAD_ZONE_PAN      3      /* 水平死区（度），第二道防线配合 Python 大死区 */
+#define DEAD_ZONE_TILT     4      /* 俯仰死区（度），上下方向需要更大死区防抖 */
+#define STEP_DEGREE        3      /* 每步移动度数 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -173,18 +174,18 @@ int main(void)
     pan_filter_x10 = (uint16_t)(((uint32_t)raw_pan * FILTER_ALPHA * 10
                      + pan_filter_x10 * (100 - FILTER_ALPHA)) / 100);
     int diff_pan = (int)(pan_filter_x10 / 10) - (int)pan_angle;
-    if      (diff_pan >  DEAD_ZONE_PAN) pan_angle += 2;
-    else if (diff_pan < -DEAD_ZONE_PAN) pan_angle -= 2;
+    if      (diff_pan >  DEAD_ZONE_PAN) pan_angle += STEP_DEGREE;
+    else if (diff_pan < -DEAD_ZONE_PAN) pan_angle -= STEP_DEGREE;
     Servo_SetPan(pan_angle);
 
-    /* ═══ 俯仰：滤波 + 死区(6°) + 1°/步 ═══ */
+    /* ═══ 俯仰：滤波 + 死区 + 加减速 ═══ */
     uint8_t raw_tilt = (uint8_t)((uint32_t)rx_bytes[1] * 180 / 0xB4);
     raw_tilt = SERVO_RANGE_MIN + (uint8_t)((uint32_t)raw_tilt * (SERVO_RANGE_MAX - SERVO_RANGE_MIN) / 180);
     tilt_filter_x10 = (uint16_t)(((uint32_t)raw_tilt * FILTER_ALPHA * 10
                       + tilt_filter_x10 * (100 - FILTER_ALPHA)) / 100);
     int diff_tilt = (int)(tilt_filter_x10 / 10) - (int)tilt_angle;
-    if      (diff_tilt >  DEAD_ZONE_TILT) tilt_angle += 2;
-    else if (diff_tilt < -DEAD_ZONE_TILT) tilt_angle -= 2;
+    if      (diff_tilt >  DEAD_ZONE_TILT) tilt_angle += STEP_DEGREE;
+    else if (diff_tilt < -DEAD_ZONE_TILT) tilt_angle -= STEP_DEGREE;
     Servo_SetTilt(tilt_angle);
 
     HAL_Delay(50);

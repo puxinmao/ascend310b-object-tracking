@@ -47,6 +47,15 @@ from tracking.deepsort import DeepSORT
 from utils.postprocessing import detections_to_tracker_inputs, draw_tracks
 from utils.serial_controller import SerialController
 
+# ── 舵机追踪控制默认参数（可通过命令行覆盖） ─────────────────
+_CAMERA_HFOV_DEG = 70.0          # 摄像头水平视场角（度）
+_TRACKING_GAIN_PAN = 0.20        # 水平追踪增益（低增益防抖，原 0.6）
+_TRACKING_GAIN_TILT = 0.08       # 俯仰追踪增益（极低——上下基本不跟）
+_CENTER_DEAD_ZONE_RATIO = 0.25   # 中心死区比例（大幅增加，原 0.10）
+_MAX_STEP_PAN = 3.0              # 水平每帧最大步长（度）
+_MAX_STEP_TILT = 1.0             # 俯仰每帧最大步长（度）
+_SMOOTH_ALPHA = 0.25             # 目标位置 EMA 平滑系数（越小越平滑）
+
 
 def parse_track_classes(track_classes_arg: str, labels: List[str]) -> Optional[List[int]]:
     if not track_classes_arg.strip():
@@ -99,6 +108,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--track-score-smoothing", type=float, default=0.7, help="Track score smoothing factor in [0, 1). Higher means less score flicker.")
     parser.add_argument("--track-classes", default="person", help="Comma-separated class names or ids to track, for example 'person,bus' or '1,6'.")
     parser.add_argument("--serial-port", default="/dev/ttyUSB0", help="Serial port for servo control. Set to empty to disable.")
+    parser.add_argument("--camera-fov", type=float, default=_CAMERA_HFOV_DEG,
+                        help=f"Camera horizontal FOV in degrees (default: {_CAMERA_HFOV_DEG}).")
+    parser.add_argument("--gain-pan", type=float, default=_TRACKING_GAIN_PAN,
+                        help=f"Horizontal tracking gain (default: {_TRACKING_GAIN_PAN}, lower = less jitter).")
+    parser.add_argument("--gain-tilt", type=float, default=_TRACKING_GAIN_TILT,
+                        help=f"Vertical tracking gain (default: {_TRACKING_GAIN_TILT}, keep very low).")
+    parser.add_argument("--dead-zone", type=float, default=_CENTER_DEAD_ZONE_RATIO,
+                        help=f"Center dead-zone ratio of half-frame (default: {_CENTER_DEAD_ZONE_RATIO}).")
+    parser.add_argument("--max-step-pan", type=float, default=_MAX_STEP_PAN,
+                        help=f"Max horizontal servo step per frame (default: {_MAX_STEP_PAN}).")
+    parser.add_argument("--max-step-tilt", type=float, default=_MAX_STEP_TILT,
+                        help=f"Max vertical servo step per frame (default: {_MAX_STEP_TILT}).")
+    parser.add_argument("--smooth-alpha", type=float, default=_SMOOTH_ALPHA,
+                        help=f"Target position EMA smoothing (default: {_SMOOTH_ALPHA}, 0.1=very smooth, 0.5=responsive).")
     return parser.parse_args()
 
 
@@ -191,6 +214,7 @@ def render_tracking_frame(
     capture_context,
     serial_ctrl: Optional[SerialController] = None,
     target_lock: Optional[list] = None,
+    servo_state: Optional[dict] = None,
 ):
     detections, profile_ms = backend.infer_with_profile(
         frame,
@@ -209,8 +233,8 @@ def render_tracking_frame(
     draw_ms = (time.perf_counter() - draw_start) * 1000.0
     timing_totals["draw"] += draw_ms
 
-    # 串口舵机控制：锁定跟随 → 算角度 → 发送
-    if serial_ctrl is not None:
+    # ── 串口舵机控制：锁定跟随 → EMA平滑 → 比例追踪 → 发送角度 ──
+    if serial_ctrl is not None and servo_state is not None:
         frame_h, frame_w = frame.shape[:2]
         locked_id = target_lock[0] if target_lock else None
         target_cx, target_cy, new_locked_id = _select_or_follow_target(
@@ -218,10 +242,51 @@ def render_tracking_frame(
         )
         if target_lock is not None:
             target_lock[0] = new_locked_id
+
         if target_cx is not None and target_cy is not None and new_locked_id is not None:
-            h_angle = int(target_cx / frame_w * 180)
-            v_angle = int(target_cy / frame_h * 180)
-            serial_ctrl.send_angles(h_angle, v_angle)
+            # ① EMA 平滑目标位置（消除检测框逐帧抖动）
+            alpha = args.smooth_alpha
+            if 'smooth_cx' not in servo_state:
+                servo_state['smooth_cx'] = target_cx
+                servo_state['smooth_cy'] = target_cy
+            else:
+                servo_state['smooth_cx'] = alpha * target_cx + (1.0 - alpha) * servo_state['smooth_cx']
+                servo_state['smooth_cy'] = alpha * target_cy + (1.0 - alpha) * servo_state['smooth_cy']
+            scx = servo_state['smooth_cx']
+            scy = servo_state['smooth_cy']
+
+            # ② 计算平滑后目标偏离画面中心的角度误差（度）
+            cam_vfov = args.camera_fov * frame_h / frame_w
+            err_x_deg = (scx - frame_w * 0.5) / frame_w * args.camera_fov
+            err_y_deg = (scy - frame_h * 0.5) / frame_h * cam_vfov
+
+            # ③ 中心死区（大幅加宽，防微抖）
+            dead_h = args.camera_fov * args.dead_zone
+            dead_v = cam_vfov * args.dead_zone
+            if abs(err_x_deg) < dead_h:
+                err_x_deg = 0.0
+            if abs(err_y_deg) < dead_v:
+                err_y_deg = 0.0
+
+            # ④ 比例控制：水平/俯仰使用各自独立的增益
+            delta_pan = err_x_deg * args.gain_pan
+            delta_tilt = err_y_deg * args.gain_tilt
+
+            # ⑤ 分别限制水平/俯仰每帧步长
+            delta_pan = max(-args.max_step_pan, min(args.max_step_pan, delta_pan))
+            delta_tilt = max(-args.max_step_tilt, min(args.max_step_tilt, delta_tilt))
+
+            # ⑥ 累积舵机角度（跨帧持久化，实现大范围追踪）
+            servo_state['pan'] += delta_pan
+            servo_state['tilt'] += delta_tilt
+            servo_state['pan'] = max(0.0, min(180.0, servo_state['pan']))
+            servo_state['tilt'] = max(0.0, min(180.0, servo_state['tilt']))
+
+            serial_ctrl.send_angles(int(servo_state['pan']), int(servo_state['tilt']))
+        else:
+            # 目标丢失：重置平滑位置，下次重新初始化
+            servo_state.pop('smooth_cx', None)
+            servo_state.pop('smooth_cy', None)
 
     return annotated, fps
 
@@ -248,7 +313,8 @@ def main() -> int:
     timing_totals = create_timing_totals()
     pending_frame = capture_context.first_frame
     pending_read_ms = capture_context.first_read_ms
-    target_lock = [None]  # 跨帧锁定状态：当前跟随的目标 ID
+    target_lock = [None]          # 跨帧锁定状态：当前跟随的目标 ID
+    servo_state = {'pan': 90.0, 'tilt': 90.0}  # 舵机累积角度（跨帧持久化）
 
     try:
         print_tracking_startup(args, labels, allowed_track_class_ids, model_path, backend, capture_context)
@@ -274,6 +340,7 @@ def main() -> int:
                 capture_context,
                 serial_ctrl=serial_ctrl,
                 target_lock=target_lock,
+                servo_state=servo_state,
             )
 
             if args.save:
