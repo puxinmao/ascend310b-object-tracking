@@ -49,12 +49,12 @@ from utils.serial_controller import SerialController
 
 # ── 舵机追踪控制默认参数（可通过命令行覆盖） ─────────────────
 _CAMERA_HFOV_DEG = 70.0          # 摄像头水平视场角（度）
-_TRACKING_GAIN_PAN = 0.20        # 水平追踪增益（低增益防抖，原 0.6）
-_TRACKING_GAIN_TILT = 0.08       # 俯仰追踪增益（极低——上下基本不跟）
-_CENTER_DEAD_ZONE_RATIO = 0.25   # 中心死区比例（大幅增加，原 0.10）
-_MAX_STEP_PAN = 3.0              # 水平每帧最大步长（度）
-_MAX_STEP_TILT = 1.0             # 俯仰每帧最大步长（度）
-_SMOOTH_ALPHA = 0.25             # 目标位置 EMA 平滑系数（越小越平滑）
+_TRACKING_GAIN_PAN = 0.35        # 水平追踪增益（平衡响应与防抖）
+_TRACKING_GAIN_TILT = 0.15       # 俯仰追踪增益（上下仍需克制）
+_CENTER_DEAD_ZONE_RATIO = 0.15   # 中心死区比例（适度收窄提升响应）
+_MAX_STEP_PAN = 4.0              # 水平每帧最大步长（度）
+_MAX_STEP_TILT = 2.0             # 俯仰每帧最大步长（度）
+_SMOOTH_ALPHA = 0.40             # 目标位置 EMA 平滑系数（加大以更快跟踪）
 
 
 def parse_track_classes(track_classes_arg: str, labels: List[str]) -> Optional[List[int]]:
@@ -233,7 +233,7 @@ def render_tracking_frame(
     draw_ms = (time.perf_counter() - draw_start) * 1000.0
     timing_totals["draw"] += draw_ms
 
-    # ── 串口舵机控制：锁定跟随 → EMA平滑 → 比例追踪 → 发送角度 ──
+    # ── 串口舵机控制：锁定跟随 → EMA平滑 → 非线性增益追踪 → 发送角度 ──
     if serial_ctrl is not None and servo_state is not None:
         frame_h, frame_w = frame.shape[:2]
         locked_id = target_lock[0] if target_lock else None
@@ -257,20 +257,32 @@ def render_tracking_frame(
 
             # ② 计算平滑后目标偏离画面中心的角度误差（度）
             cam_vfov = args.camera_fov * frame_h / frame_w
+            half_hfov = args.camera_fov * 0.5
+            half_vfov = cam_vfov * 0.5
             err_x_deg = (scx - frame_w * 0.5) / frame_w * args.camera_fov
             err_y_deg = (scy - frame_h * 0.5) / frame_h * cam_vfov
 
-            # ③ 中心死区（大幅加宽，防微抖）
+            # ③ 死区：误差小于阈值 → 完全不动
             dead_h = args.camera_fov * args.dead_zone
             dead_v = cam_vfov * args.dead_zone
-            if abs(err_x_deg) < dead_h:
-                err_x_deg = 0.0
-            if abs(err_y_deg) < dead_v:
-                err_y_deg = 0.0
+            abs_x = abs(err_x_deg)
+            abs_y = abs(err_y_deg)
 
-            # ④ 比例控制：水平/俯仰使用各自独立的增益
-            delta_pan = err_x_deg * args.gain_pan
-            delta_tilt = err_y_deg * args.gain_tilt
+            # ④ 非线性增益：近中心轻柔防过冲，远边缘全速追
+            def _soft_gain(abs_err, dead, half_fov, base_gain):
+                """死区外：随误差增大，增益从 30% 平滑爬升到 100%"""
+                if abs_err <= dead:
+                    return 0.0
+                # t: 0(刚出死区) → 1(边缘)
+                t = min(1.0, (abs_err - dead) / max(half_fov - dead, 0.1))
+                effective = base_gain * (0.30 + 0.70 * t)  # 30%~100% 爬升
+                return effective
+
+            gain_x = _soft_gain(abs_x, dead_h, half_hfov, args.gain_pan)
+            gain_y = _soft_gain(abs_y, dead_v, half_vfov, args.gain_tilt)
+
+            delta_pan = err_x_deg * gain_x
+            delta_tilt = err_y_deg * gain_y
 
             # ⑤ 分别限制水平/俯仰每帧步长
             delta_pan = max(-args.max_step_pan, min(args.max_step_pan, delta_pan))

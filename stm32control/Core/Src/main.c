@@ -38,13 +38,13 @@
 #define SERVO_RANGE_MIN    0      /* 舵机最小角度（扩展至 0°，原 30°） */
 #define SERVO_RANGE_MAX    180    /* 舵机最大角度（扩展至 180°，原 150°） */
 
-#define SPEED_MAX          6      /* 最大速度（度/步），实际使用 STEP_DEGREE */
+#define SPEED_MAX          8      /* 最大速度（度/步），实际使用 STEP_DEGREE */
 
-/* 防抖参数 */
-#define FILTER_ALPHA       35     /* 输入滤波系数 0~100 (越大响应越快，Python已平滑故提高) */
-#define DEAD_ZONE_PAN      3      /* 水平死区（度），第二道防线配合 Python 大死区 */
-#define DEAD_ZONE_TILT     4      /* 俯仰死区（度），上下方向需要更大死区防抖 */
-#define STEP_DEGREE        3      /* 每步移动度数 */
+/* 防抖参数 — 提速版：Python端已做平滑，STM32端适当放宽 */
+#define FILTER_ALPHA       45     /* 输入滤波系数 0~100 (越大响应越快) */
+#define DEAD_ZONE_PAN      2      /* 水平死区（度） */
+#define DEAD_ZONE_TILT     2      /* 俯仰死区（度） */
+#define STEP_DEGREE        4      /* 每步移动度数 */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
