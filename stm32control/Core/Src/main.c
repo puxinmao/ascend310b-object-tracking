@@ -34,17 +34,22 @@
 /* 舵机 PWM 参数 */
 #define SERVO_PULSE_MIN    500    /* 0°   → 0.5ms */
 #define SERVO_PULSE_MAX    2500   /* 180° → 2.5ms */
-#define STEP_DELAY_MS      50     /* 主循环周期 (ms) */
-#define SERVO_RANGE_MIN    0      /* 舵机最小角度（扩展至 0°，原 30°） */
-#define SERVO_RANGE_MAX    180    /* 舵机最大角度（扩展至 180°，原 150°） */
+#define SERVO_RANGE_MIN    0      /* 舵机机械最小角度 */
+#define SERVO_RANGE_MAX    180    /* 舵机机械最大角度 */
 
-#define SPEED_MAX          8      /* 最大速度（度/步），实际使用 STEP_DEGREE */
+/* 主循环节奏 — 非阻塞时间片 (ms) */
+#define LOOP_PERIOD_MS     20
 
-/* 防抖参数 — 提速版：Python端已做平滑，STM32端适当放宽 */
-#define FILTER_ALPHA       45     /* 输入滤波系数 0~100 (越大响应越快) */
+/* 串口协议帧: [0xAA] [0x55] [pan] [tilt] [checksum], checksum=(pan+tilt)&0xFF */
+#define FRAME_HEAD1        0xAA
+#define FRAME_HEAD2        0x55
+
+/* 舵机控制参数 — Python端已做 EMA+增益平滑，STM32端只保留死区+限速 */
 #define DEAD_ZONE_PAN      2      /* 水平死区（度） */
 #define DEAD_ZONE_TILT     2      /* 俯仰死区（度） */
-#define STEP_DEGREE        4      /* 每步移动度数 */
+#define MAX_STEP_PAN       10     /* 水平每周期最大步长（度）：小误差一步到位，大误差限速 */
+#define MAX_STEP_TILT      6      /* 俯仰每周期最大步长（度） */
+#define PAN_INVERT         1      /* 水平舵机机械方向反向补偿 (1=反向, 0=同向) */
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -58,14 +63,25 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart1;
 
 /* USER CODE BEGIN PV */
-volatile uint8_t rx_bytes[2] = {0x5A, 0x5A}; /* [0]=水平, [1]=俯仰 */
-volatile uint8_t rx_byte   = 0;              /* 中断接收临时缓冲 */
-volatile uint8_t rx_toggle = 0;              /* 0=收水平, 1=收俯仰 */
-volatile uint8_t rx_count  = 0;              /* 收到字节计数器（用于调试） */
-uint8_t  pan_angle  = 90;        /* 当前水平舵机角度 */
-uint16_t pan_filter_x10  = 900;  /* 水平滤波目标×10 */
-uint8_t  tilt_angle = 90;        /* 当前俯仰舵机角度 */
-uint16_t tilt_filter_x10 = 900;  /* 俯仰滤波目标×10 */
+/* ── 串口接收状态机 ── 帧头同步：丢一字节也能在下一帧自动重新对齐 */
+typedef enum {
+    RX_WAIT_HEAD1 = 0,
+    RX_WAIT_HEAD2,
+    RX_WAIT_PAN,
+    RX_WAIT_TILT,
+    RX_WAIT_CHK,
+} rx_state_t;
+
+volatile rx_state_t rx_state   = RX_WAIT_HEAD1;
+volatile uint8_t    rx_byte    = 0;              /* 中断接收临时缓冲 */
+volatile uint8_t    rx_buf[2]  = {90, 90};       /* 当前帧暂存 [pan, tilt] */
+volatile uint8_t    rx_bytes[2] = {90, 90};      /* 最近一帧有效数据 [水平, 俯仰] */
+volatile uint32_t   rx_count   = 0;              /* 已收到的有效帧计数 */
+volatile uint32_t   rx_bytes_seen = 0;           /* 已收到的字节计数（LED 诊断用） */
+volatile uint32_t   rx_drops   = 0;              /* 校验失败/丢帧计数（调试用） */
+
+int pan_angle  = 90;        /* 当前水平舵机角度 */
+int tilt_angle = 90;        /* 当前俯仰舵机角度 */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -159,36 +175,57 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
+  uint32_t last_loop_tick = HAL_GetTick();
   while (1)
   {
-    /* LED: 收到数据就常亮 */
+    uint32_t now = HAL_GetTick();
+
+    /* LED 三态故障诊断：
+       常亮     = 收到有效帧，系统正常 (rx_count>0)
+       慢闪 1Hz = 收到字节但无有效帧（协议不匹配 / 校验失败）
+       快闪 5Hz = 完全没收到字节（接线 / 串口号 / 波特率 / 中断问题） */
+    static uint32_t led_tick = 0;
+    static int led_state = 0;
     if (rx_count > 0) {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET);   /* 常亮 */
     } else {
-        HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_SET);
+        uint32_t blink_period = (rx_bytes_seen > 0) ? 500 : 100; /* 慢闪 / 快闪 */
+        if (now - led_tick >= blink_period) {
+            led_tick = now;
+            led_state = !led_state;
+            HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13,
+                              led_state ? GPIO_PIN_RESET : GPIO_PIN_SET);
+        }
     }
 
-    /* ═══ 水平：滤波 + 死区 + 加减速 ═══ */
-    uint8_t raw_pan = (uint8_t)(180 - ((uint32_t)rx_bytes[0] * 180 / 0xB4));
-    raw_pan = SERVO_RANGE_MIN + (uint8_t)((uint32_t)raw_pan * (SERVO_RANGE_MAX - SERVO_RANGE_MIN) / 180);
-    pan_filter_x10 = (uint16_t)(((uint32_t)raw_pan * FILTER_ALPHA * 10
-                     + pan_filter_x10 * (100 - FILTER_ALPHA)) / 100);
-    int diff_pan = (int)(pan_filter_x10 / 10) - (int)pan_angle;
-    if      (diff_pan >  DEAD_ZONE_PAN) pan_angle += STEP_DEGREE;
-    else if (diff_pan < -DEAD_ZONE_PAN) pan_angle -= STEP_DEGREE;
-    Servo_SetPan(pan_angle);
+    /* 非阻塞时间片：每 LOOP_PERIOD_MS ms 更新一次舵机，不阻塞中断 */
+    if (now - last_loop_tick >= LOOP_PERIOD_MS) {
+        last_loop_tick = now;
 
-    /* ═══ 俯仰：滤波 + 死区 + 加减速 ═══ */
-    uint8_t raw_tilt = (uint8_t)((uint32_t)rx_bytes[1] * 180 / 0xB4);
-    raw_tilt = SERVO_RANGE_MIN + (uint8_t)((uint32_t)raw_tilt * (SERVO_RANGE_MAX - SERVO_RANGE_MIN) / 180);
-    tilt_filter_x10 = (uint16_t)(((uint32_t)raw_tilt * FILTER_ALPHA * 10
-                      + tilt_filter_x10 * (100 - FILTER_ALPHA)) / 100);
-    int diff_tilt = (int)(tilt_filter_x10 / 10) - (int)tilt_angle;
-    if      (diff_tilt >  DEAD_ZONE_TILT) tilt_angle += STEP_DEGREE;
-    else if (diff_tilt < -DEAD_ZONE_TILT) tilt_angle -= STEP_DEGREE;
-    Servo_SetTilt(tilt_angle);
+        /* ═══ 水平：机械方向补偿 → 死区 + 可变步长（EMA 已在 Python 端完成） ═══ */
+        int target_pan = PAN_INVERT ? (180 - (int)rx_bytes[0]) : (int)rx_bytes[0];
+        int diff_pan = target_pan - pan_angle;
+        if (diff_pan > DEAD_ZONE_PAN) {
+            pan_angle += (diff_pan > MAX_STEP_PAN ? MAX_STEP_PAN : diff_pan);
+        } else if (diff_pan < -DEAD_ZONE_PAN) {
+            pan_angle -= (-diff_pan > MAX_STEP_PAN ? MAX_STEP_PAN : -diff_pan);
+        }
+        if (pan_angle > SERVO_RANGE_MAX) pan_angle = SERVO_RANGE_MAX;
+        if (pan_angle < SERVO_RANGE_MIN) pan_angle = SERVO_RANGE_MIN;
+        Servo_SetPan(pan_angle);
 
-    HAL_Delay(50);
+        /* ═══ 俯仰：死区 + 可变步长 ═══ */
+        int target_tilt = (int)rx_bytes[1];
+        int diff_tilt = target_tilt - tilt_angle;
+        if (diff_tilt > DEAD_ZONE_TILT) {
+            tilt_angle += (diff_tilt > MAX_STEP_TILT ? MAX_STEP_TILT : diff_tilt);
+        } else if (diff_tilt < -DEAD_ZONE_TILT) {
+            tilt_angle -= (-diff_tilt > MAX_STEP_TILT ? MAX_STEP_TILT : -diff_tilt);
+        }
+        if (tilt_angle > SERVO_RANGE_MAX) tilt_angle = SERVO_RANGE_MAX;
+        if (tilt_angle < SERVO_RANGE_MIN) tilt_angle = SERVO_RANGE_MIN;
+        Servo_SetTilt(tilt_angle);
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -352,21 +389,65 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 
 /**
- * @brief  UART 接收完成回调
- *         每收到 1 字节，交替存入 rx_bytes[0]（水平）和 rx_bytes[1]（俯仰）
+ * @brief  UART 接收完成回调 — 逐字节推进帧解析状态机
+ *         帧: [0xAA][0x55][pan][tilt][checksum=(pan+tilt)&0xFF]
+ *         任何字节丢失后，状态机在下一帧 0xAA→0x55 处自动重新同步。
  */
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
     if (huart->Instance == USART1)
     {
-        if (rx_toggle == 0) {
-            rx_bytes[0] = rx_byte;  /* 第 1 字节 → 水平 */
-            rx_toggle = 1;
-        } else {
-            rx_bytes[1] = rx_byte;  /* 第 2 字节 → 俯仰 */
-            rx_toggle = 0;
+        uint8_t b = rx_byte;
+        rx_bytes_seen++;                       /* 任意字节都计数（LED 诊断用） */
+        switch (rx_state)
+        {
+            case RX_WAIT_HEAD1:
+                if (b == FRAME_HEAD1) rx_state = RX_WAIT_HEAD2;
+                break;
+            case RX_WAIT_HEAD2:
+                if (b == FRAME_HEAD2) {
+                    rx_state = RX_WAIT_PAN;
+                } else if (b == FRAME_HEAD1) {
+                    rx_state = RX_WAIT_HEAD2;   /* 连续 0xAA，继续等 0x55 */
+                } else {
+                    rx_state = RX_WAIT_HEAD1;
+                }
+                break;
+            case RX_WAIT_PAN:
+                rx_buf[0] = b;
+                rx_state = RX_WAIT_TILT;
+                break;
+            case RX_WAIT_TILT:
+                rx_buf[1] = b;
+                rx_state = RX_WAIT_CHK;
+                break;
+            case RX_WAIT_CHK:
+                if (b == (uint8_t)((rx_buf[0] + rx_buf[1]) & 0xFF)) {
+                    rx_bytes[0] = rx_buf[0];    /* 校验通过 → 提交有效数据 */
+                    rx_bytes[1] = rx_buf[1];
+                    rx_count++;
+                } else {
+                    rx_drops++;                  /* 校验失败，丢弃，等下一帧 */
+                }
+                rx_state = RX_WAIT_HEAD1;
+                break;
         }
-        rx_count++;
+        HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+    }
+}
+
+/**
+ * @brief  UART 错误回调 — 出现 ORE/FE/NE 等错误时清标志并重启接收
+ *         否则 HAL 在错误后会停止接收，导致永久收不到数据。
+ */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
+{
+    if (huart->Instance == USART1)
+    {
+        __HAL_UART_CLEAR_OREFLAG(huart);
+        huart->ErrorCode = HAL_UART_ERROR_NONE;
+        huart->RxState = HAL_UART_STATE_READY;  /* 强制复位，否则 Receive_IT 返回 HAL_BUSY 永久卡死 */
+        rx_state = RX_WAIT_HEAD1;               /* 复位状态机，避免半帧残留 */
         HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
     }
 }

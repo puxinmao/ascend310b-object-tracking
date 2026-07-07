@@ -1,6 +1,11 @@
 """
 串口控制器 — 通过 USB-TTL 将目标角度发送到 STM32。
 
+帧协议（5 字节，带帧头 + 校验和，STM32 端可抵抗丢字节错位）:
+    [0xAA] [0x55] [pan] [tilt] [checksum]
+    checksum = (pan + tilt) & 0xFF
+    pan/tilt 范围 0~180（uint8 可安全承载）。
+
 用法:
     controller = SerialController()
     controller.send_angles(90, 90)  # 发送水平90°, 俯仰90°
@@ -12,8 +17,13 @@
 import serial
 
 
+# ── 串口帧协议常量 ──────────────────────────────────────────────
+FRAME_HEAD1 = 0xAA   # 帧头字节 1
+FRAME_HEAD2 = 0x55   # 帧头字节 2
+
+
 class SerialController:
-    """通过串口发送舵机角度的控制器。"""
+    """通过串口发送舵机角度的控制器（带帧头+校验和的 5 字节协议）。"""
 
     def __init__(self, port: str = "/dev/ttyUSB0", baud: int = 115200, timeout: float = 0.01):
         """
@@ -42,7 +52,9 @@ class SerialController:
         """
         发送水平和俯仰角度 (各 0~180)。
 
-        发送 2 字节：[水平, 俯仰]，丢帧不影响（下一帧会补发）。
+        发送 5 字节帧 [0xAA, 0x55, pan, tilt, checksum]：
+        STM32 端用状态机按帧头同步，丢一字节也能在下一帧自动重新对齐
+        （旧版裸 2 字节协议一旦丢字节就会永久错位）。
         角度会自动钳位到 0~180 范围。
 
         Args:
@@ -52,10 +64,12 @@ class SerialController:
         if not self._enabled or self.ser is None:
             return
 
-        h_angle = max(0, min(180, int(h_angle)))
-        v_angle = max(0, min(180, int(v_angle)))
+        h = max(0, min(180, int(h_angle)))
+        v = max(0, min(180, int(v_angle)))
+        checksum = (h + v) & 0xFF
+        frame = bytes([FRAME_HEAD1, FRAME_HEAD2, h, v, checksum])
         try:
-            self.ser.write(bytes([h_angle, v_angle]))
+            self.ser.write(frame)
         except Exception as exc:
             print(f"[SerialController] 发送失败: {exc}")
 
