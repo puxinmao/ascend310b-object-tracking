@@ -1,10 +1,10 @@
 """
 串口控制器 — 通过 USB-TTL 将目标角度发送到 STM32。
 
-帧协议（5 字节，带帧头 + 校验和，STM32 端可抵抗丢字节错位）:
-    [0xAA] [0x55] [pan] [tilt] [checksum]
-    checksum = (pan + tilt) & 0xFF
-    pan/tilt 范围 0~180（uint8 可安全承载）。
+帧协议（6 字节，带帧头 + 校验和，STM32 端可抵抗丢字节错位）:
+    [0xAA] [0x55] [pan] [tilt] [track_id] [checksum]
+    checksum = (pan + tilt + track_id) & 0xFF
+    pan/tilt 范围 0~180, track_id 0~255（uint8 可安全承载）。
 
 用法:
     controller = SerialController()
@@ -48,26 +48,28 @@ class SerialController:
             print(f"[SerialController] 警告: 无法打开串口 {port}: {exc}")
             print("[SerialController] 舵机控制已禁用，跟踪功能正常运行。")
 
-    def send_angles(self, h_angle: int, v_angle: int) -> None:
+    def send_angles(self, h_angle: int, v_angle: int, track_id: int = 0) -> None:
         """
-        发送水平和俯仰角度 (各 0~180)。
+        发送水平/俯仰角度 + 当前跟踪目标 ID。
 
-        发送 5 字节帧 [0xAA, 0x55, pan, tilt, checksum]：
-        STM32 端用状态机按帧头同步，丢一字节也能在下一帧自动重新对齐
-        （旧版裸 2 字节协议一旦丢字节就会永久错位）。
-        角度会自动钳位到 0~180 范围。
+        发送 6 字节帧 [0xAA, 0x55, pan, tilt, track_id, checksum]：
+        checksum = (pan + tilt + track_id) & 0xFF
+        STM32 端用状态机按帧头同步，丢一字节也能在下一帧自动重新对齐。
+        track_id=0 表示无目标。
 
         Args:
             h_angle: 水平角度 0~180（左→右）
             v_angle: 俯仰角度 0~180（上→下）
+            track_id: 当前跟踪目标 ID（0~255，0=无目标）
         """
         if not self._enabled or self.ser is None:
             return
 
         h = max(0, min(180, int(h_angle)))
         v = max(0, min(180, int(v_angle)))
-        checksum = (h + v) & 0xFF
-        frame = bytes([FRAME_HEAD1, FRAME_HEAD2, h, v, checksum])
+        t = max(0, min(255, int(track_id)))
+        checksum = (h + v + t) & 0xFF
+        frame = bytes([FRAME_HEAD1, FRAME_HEAD2, h, v, t, checksum])
         try:
             self.ser.write(frame)
         except Exception as exc:

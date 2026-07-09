@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "oled.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -40,7 +40,7 @@
 /* 主循环节奏 — 非阻塞时间片 (ms) */
 #define LOOP_PERIOD_MS     20
 
-/* 串口协议帧: [0xAA] [0x55] [pan] [tilt] [checksum], checksum=(pan+tilt)&0xFF */
+/* 串口协议帧: [0xAA] [0x55] [pan] [tilt] [track_id] [checksum], checksum=(pan+tilt+id)&0xFF */
 #define FRAME_HEAD1        0xAA
 #define FRAME_HEAD2        0x55
 
@@ -58,6 +58,8 @@
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
+I2C_HandleTypeDef hi2c1;
+
 TIM_HandleTypeDef htim2;
 
 UART_HandleTypeDef huart1;
@@ -69,13 +71,14 @@ typedef enum {
     RX_WAIT_HEAD2,
     RX_WAIT_PAN,
     RX_WAIT_TILT,
+    RX_WAIT_ID,
     RX_WAIT_CHK,
 } rx_state_t;
 
 volatile rx_state_t rx_state   = RX_WAIT_HEAD1;
 volatile uint8_t    rx_byte    = 0;              /* 中断接收临时缓冲 */
-volatile uint8_t    rx_buf[2]  = {90, 90};       /* 当前帧暂存 [pan, tilt] */
-volatile uint8_t    rx_bytes[2] = {90, 90};      /* 最近一帧有效数据 [水平, 俯仰] */
+volatile uint8_t    rx_buf[3]  = {90, 90, 0};    /* 当前帧暂存 [pan, tilt, track_id] */
+volatile uint8_t    rx_bytes[3] = {90, 90, 0};   /* 最近一帧有效数据 [水平, 俯仰, 跟踪ID] */
 volatile uint32_t   rx_count   = 0;              /* 已收到的有效帧计数 */
 volatile uint32_t   rx_bytes_seen = 0;           /* 已收到的字节计数（LED 诊断用） */
 volatile uint32_t   rx_drops   = 0;              /* 校验失败/丢帧计数（调试用） */
@@ -89,6 +92,7 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_TIM2_Init(void);
 static void MX_USART1_UART_Init(void);
+static void MX_I2C1_Init(void);
 /* USER CODE BEGIN PFP */
 static void Servo_SetPan(int angle);
 static void Servo_SetTilt(int angle);
@@ -152,9 +156,10 @@ int main(void)
   MX_GPIO_Init();
   MX_TIM2_Init();
   MX_USART1_UART_Init();
-  /* 立即启动串口中断接收 */
-  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
+  MX_I2C1_Init();
   /* USER CODE BEGIN 2 */
+  /* 启动串口中断接收 — 必须放在 USER CODE 区,否则 CubeMX 重新生成会清掉 */
+  HAL_UART_Receive_IT(&huart1, (uint8_t *)&rx_byte, 1);
   /* LED 闪烁 2 次 — 指示芯片已启动 */
   for (int i = 0; i < 2; i++) {
     HAL_GPIO_WritePin(GPIOC, GPIO_PIN_13, GPIO_PIN_RESET); /* 亮 */
@@ -171,6 +176,14 @@ int main(void)
   Servo_SetPan(30);  HAL_Delay(500);
   Servo_SetPan(150); HAL_Delay(500);
   Servo_SetPan(90);  HAL_Delay(500);
+
+  /* ── OLED 初始化 + 启动画面 ── */
+  OLED_Init();
+  OLED_DrawString(0, 0, "PAN:---");
+  OLED_DrawString(0, 1, "TLT:---");
+  OLED_DrawString(0, 2, "ID:---");
+  OLED_DrawString(0, 4, "SERVO READY");
+  OLED_Refresh();
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -226,6 +239,25 @@ int main(void)
         if (tilt_angle < SERVO_RANGE_MIN) tilt_angle = SERVO_RANGE_MIN;
         Servo_SetTilt(tilt_angle);
     }
+
+    /* OLED 显示:每 ~200ms 刷一次 (10Hz,够人眼看;I2C 阻塞约 24ms 不影响舵机) */
+    static uint32_t last_oled_tick = 0;
+    if (now - last_oled_tick >= 200) {
+        last_oled_tick = now;
+        OLED_Clear();
+        OLED_DrawString(0, 0, "PAN:");
+        OLED_DrawInt(30, 0, pan_angle, 3);
+        OLED_DrawString(0, 1, "TLT:");
+        OLED_DrawInt(30, 1, tilt_angle, 3);
+        int tid = (int)rx_bytes[2];
+        if (tid > 0) {
+            OLED_DrawString(0, 2, "ID:");
+            OLED_DrawInt(24, 2, tid, 3);
+        } else {
+            OLED_DrawString(0, 2, "ID:---");
+        }
+        OLED_Refresh();
+    }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
@@ -270,6 +302,40 @@ void SystemClock_Config(void)
   {
     Error_Handler();
   }
+}
+
+/**
+  * @brief I2C1 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_I2C1_Init(void)
+{
+
+  /* USER CODE BEGIN I2C1_Init 0 */
+
+  /* USER CODE END I2C1_Init 0 */
+
+  /* USER CODE BEGIN I2C1_Init 1 */
+
+  /* USER CODE END I2C1_Init 1 */
+  hi2c1.Instance = I2C1;
+  hi2c1.Init.ClockSpeed = 400000;
+  hi2c1.Init.DutyCycle = I2C_DUTYCYCLE_2;
+  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
+  hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
+  hi2c1.Init.OwnAddress2 = 0;
+  hi2c1.Init.GeneralCallMode = I2C_GENERALCALL_DISABLE;
+  hi2c1.Init.NoStretchMode = I2C_NOSTRETCH_DISABLE;
+  if (HAL_I2C_Init(&hi2c1) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN I2C1_Init 2 */
+
+  /* USER CODE END I2C1_Init 2 */
+
 }
 
 /**
@@ -372,6 +438,7 @@ static void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOD_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
   __HAL_RCC_GPIOC_CLK_ENABLE();
@@ -419,12 +486,17 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
                 break;
             case RX_WAIT_TILT:
                 rx_buf[1] = b;
+                rx_state = RX_WAIT_ID;
+                break;
+            case RX_WAIT_ID:
+                rx_buf[2] = b;
                 rx_state = RX_WAIT_CHK;
                 break;
             case RX_WAIT_CHK:
-                if (b == (uint8_t)((rx_buf[0] + rx_buf[1]) & 0xFF)) {
+                if (b == (uint8_t)((rx_buf[0] + rx_buf[1] + rx_buf[2]) & 0xFF)) {
                     rx_bytes[0] = rx_buf[0];    /* 校验通过 → 提交有效数据 */
                     rx_bytes[1] = rx_buf[1];
+                    rx_bytes[2] = rx_buf[2];
                     rx_count++;
                 } else {
                     rx_drops++;                  /* 校验失败，丢弃，等下一帧 */
